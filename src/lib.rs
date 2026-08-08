@@ -3925,7 +3925,7 @@ fn process_document(
                                         let visible_chars = text_chars(&items, *page);
                                         let all_chars = text_chars(&retry_items, *page);
                                         visible_chars == 0
-                                            || all_chars >= visible_chars.saturating_mul(2)
+                                            || all_chars > visible_chars
                                     })
                                     .collect();
 
