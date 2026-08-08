@@ -471,7 +471,7 @@ pub fn extract_pages_markdown_mem(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _invisible_pages) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -736,7 +736,7 @@ pub fn extract_text_in_regions_mem(
         page_heights.insert(*page_num, height);
 
         // Extract text items for this page
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+        let ((mut items, _rects, _lines), has_gid, coords_rotated, _has_invisible_text) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -901,7 +901,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, rects, lines), has_gid, coords_rotated) =
+        let ((mut items, rects, lines), has_gid, coords_rotated, _has_invisible_text) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -1212,7 +1212,7 @@ pub fn detect_vector_grid_in_region_mem(
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
     let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated) =
+    let ((mut items, rects, lines), _has_gid, coords_rotated, _has_invisible_text) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -1406,15 +1406,16 @@ mod vector_grid_tests {
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
-            &doc,
-            page_id,
-            1,
-            &cmaps,
-            false,
-            &mut crate::extractor::FontStyleCache::new(),
-        )
-        .unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated, _has_invisible_text) =
+            extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &cmaps,
+                false,
+                &mut crate::extractor::FontStyleCache::new(),
+            )
+            .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
         assert_eq!(rect_tables.len(), 1, "expected one rect-detected table");
@@ -1448,15 +1449,16 @@ mod vector_grid_tests {
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
-            &doc,
-            page_id,
-            page_num,
-            &cmaps,
-            false,
-            &mut crate::extractor::FontStyleCache::new(),
-        )
-        .unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated, _has_invisible_text) =
+            extract_page_text_items(
+                &doc,
+                page_id,
+                page_num,
+                &cmaps,
+                false,
+                &mut crate::extractor::FontStyleCache::new(),
+            )
+            .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, page_num);
         rect_tables
@@ -2184,7 +2186,7 @@ pub fn extract_tables_with_structure_cells_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _has_invisible_text) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -2986,7 +2988,7 @@ fn detect_tsr_quality_issue(
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _has_invisible_text) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -3552,26 +3554,39 @@ fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document
 fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut candidates = Vec::new();
 
-    add_repair_candidate(&mut candidates, repair_inline_xref_header(buf), buf);
-    add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
-    add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
+    add_container_repair_pipeline(&mut candidates, buf, buf, false);
 
     let stripped = strip_leading_pdf_container_bytes(buf);
     if let Some(stripped_buf) = stripped.as_deref() {
-        add_repair_candidate(&mut candidates, Some(stripped_buf.to_vec()), buf);
-        add_repair_candidate(
-            &mut candidates,
-            append_missing_eof_marker(stripped_buf),
-            buf,
-        );
-        add_repair_candidate(
-            &mut candidates,
-            recover_startxref_pointer(stripped_buf),
-            buf,
-        );
+        add_container_repair_pipeline(&mut candidates, stripped_buf, buf, true);
     }
 
     candidates
+}
+
+fn add_container_repair_pipeline(
+    candidates: &mut Vec<Vec<u8>>,
+    seed: &[u8],
+    original: &[u8],
+    include_seed: bool,
+) {
+    let mut current = seed.to_vec();
+    if include_seed {
+        add_repair_candidate(candidates, Some(current.clone()), original);
+    }
+
+    for repair in [
+        append_missing_eof_marker as fn(&[u8]) -> Option<Vec<u8>>,
+        repair_inline_xref_header,
+        recover_startxref_pointer,
+        repair_inline_xref_header,
+    ] {
+        let Some(repaired) = repair(&current) else {
+            continue;
+        };
+        current = repaired;
+        add_repair_candidate(candidates, Some(current.clone()), original);
+    }
 }
 
 /// Some PDF writers emit a `startxref` pointer that doesn't actually point
@@ -3835,12 +3850,143 @@ fn process_document(
             options.page_filter.as_ref(),
         );
 
-        // Retry an empty text-based result with invisible (Tr=3) text included.
-        // Some OCR-backed PDFs contain only an invisible text layer but are
-        // classified as TextBased because they have many text operators.
-        // Mixed/template PDFs additionally retry garbage visible text.
-        if matches!(pdf_type, PdfType::TextBased | PdfType::Mixed) {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
+        let result = if matches!(pdf_type, PdfType::TextBased | PdfType::Mixed) {
+            result.map(
+                |(
+                    (mut items, mut rects, mut lines),
+                    mut page_thresholds,
+                    mut gid_encoded_pages,
+                    invisible_text_pages,
+                )| {
+                    let retry_pages: HashSet<u32> = invisible_text_pages
+                        .iter()
+                        .copied()
+                        .filter(|page| {
+                            options
+                                .page_filter
+                                .as_ref()
+                                .is_none_or(|filter| filter.contains(page))
+                        })
+                        .collect();
+
+                    if !retry_pages.is_empty() {
+                        match extractor::extract_positioned_text_include_invisible_with_folio_context(
+                            &doc,
+                            &font_cmaps,
+                            Some(&retry_pages),
+                        ) {
+                            Ok((
+                                (mut retry_items, retry_rects, retry_lines),
+                                retry_thresholds,
+                                retry_gid_pages,
+                                _,
+                            )) => {
+                                // OCR layers can repeat visible text at the same baseline.
+                                let mut overlay_keys = HashSet::new();
+                                retry_items.retain(|item| {
+                                    let kind = match &item.item_type {
+                                        types::ItemType::Text => 0u8,
+                                        types::ItemType::FormField => 1u8,
+                                        _ => return true,
+                                    };
+                                    let quantize = |value: f32| (value * 2.0).round() as i32;
+                                    overlay_keys.insert((
+                                        item.page,
+                                        kind,
+                                        item.text.clone(),
+                                        quantize(item.x),
+                                        quantize(item.y),
+                                        quantize(item.height),
+                                    ))
+                                });
+                                let text_chars = |page_items: &[TextItem], page: u32| {
+                                    page_items
+                                        .iter()
+                                        .filter(|item| {
+                                            item.page == page
+                                                && matches!(
+                                                    item.item_type,
+                                                    types::ItemType::Text
+                                                        | types::ItemType::FormField
+                                                )
+                                        })
+                                        .map(|item| {
+                                            item.text
+                                                .chars()
+                                                .filter(|ch| !ch.is_whitespace())
+                                                .count()
+                                        })
+                                        .sum::<usize>()
+                                };
+                                let pages_to_replace: HashSet<u32> = retry_pages
+                                    .iter()
+                                    .copied()
+                                    .filter(|page| {
+                                        let visible_chars = text_chars(&items, *page);
+                                        let all_chars = text_chars(&retry_items, *page);
+                                        visible_chars == 0
+                                            || all_chars >= visible_chars.saturating_mul(2)
+                                    })
+                                    .collect();
+
+                                if !pages_to_replace.is_empty() {
+                                    items.retain(|item| !pages_to_replace.contains(&item.page));
+                                    items.extend(
+                                        retry_items
+                                            .into_iter()
+                                            .filter(|item| pages_to_replace.contains(&item.page)),
+                                    );
+                                    rects.retain(|rect| !pages_to_replace.contains(&rect.page));
+                                    rects.extend(
+                                        retry_rects
+                                            .into_iter()
+                                            .filter(|rect| pages_to_replace.contains(&rect.page)),
+                                    );
+                                    lines.retain(|line| !pages_to_replace.contains(&line.page));
+                                    lines.extend(
+                                        retry_lines
+                                            .into_iter()
+                                            .filter(|line| pages_to_replace.contains(&line.page)),
+                                    );
+                                    page_thresholds
+                                        .retain(|page, _| !pages_to_replace.contains(page));
+                                    page_thresholds.extend(
+                                        retry_thresholds
+                                            .into_iter()
+                                            .filter(|(page, _)| pages_to_replace.contains(page)),
+                                    );
+                                    gid_encoded_pages.extend(
+                                        retry_gid_pages
+                                            .into_iter()
+                                            .filter(|page| pages_to_replace.contains(page)),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                log::debug!(
+                                    "invisible-text page retry failed; keeping visible extraction: {}",
+                                    error
+                                );
+                            }
+                        }
+                    }
+
+                    (
+                        (items, rects, lines),
+                        page_thresholds,
+                        gid_encoded_pages,
+                        invisible_text_pages,
+                    )
+                },
+            )
+        } else {
+            result
+        };
+
+        // Mixed/template PDFs additionally retry wholly empty or garbage
+        // visible text, preserving the existing scanned-image fallback.
+        if pdf_type == PdfType::Mixed {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -3855,9 +4001,7 @@ fn process_document(
                     .take(200)
                     .map(|item| item.text.as_str())
                     .collect();
-                if sample.trim().is_empty()
-                    || (pdf_type == PdfType::Mixed && is_garbage_text(&sample))
-                {
+                if sample.trim().is_empty() || is_garbage_text(&sample) {
                     extractor::extract_positioned_text_include_invisible_with_folio_context(
                         &doc,
                         &font_cmaps,
@@ -3866,15 +4010,13 @@ fn process_document(
                 } else {
                     result
                 }
-            } else if pdf_type == PdfType::Mixed {
+            } else {
                 // Normal extraction failed — try invisible as fallback
                 extractor::extract_positioned_text_include_invisible_with_folio_context(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
                 )
-            } else {
-                result
             }
         } else {
             result
@@ -3915,7 +4057,12 @@ fn process_document(
         text_quality_pages,
         text_quality_reasons_by_page,
     ) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages)) => {
+        Some((
+            (items, rects, lines),
+            page_thresholds,
+            gid_encoded_pages,
+            _invisible_text_pages,
+        )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
@@ -6178,6 +6325,58 @@ mod tests {
     fn loads_pdf_with_xref_section_on_keyword_line() {
         let (doc, page_count) = load_document_from_mem(&minimal_pdf_with_inline_xref_header())
             .expect("inline xref section header should be repaired");
+
+        assert_eq!(page_count, 0);
+        assert_eq!(
+            doc.trailer.get(b"Root").unwrap().as_reference().unwrap(),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn loads_inline_xref_pdf_with_leading_bom() {
+        let mut pdf = vec![0xEF, 0xBB, 0xBF];
+        pdf.extend_from_slice(&minimal_pdf_with_inline_xref_header());
+
+        let (doc, page_count) = load_document_from_mem(&pdf)
+            .expect("leading BOM and inline xref should both be repaired");
+
+        assert_eq!(page_count, 0);
+        assert_eq!(
+            doc.trailer.get(b"Root").unwrap().as_reference().unwrap(),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn loads_inline_xref_pdf_with_truncated_eof() {
+        let mut pdf = minimal_pdf_with_inline_xref_header();
+        assert!(pdf.ends_with(b"%%EOF\n"));
+        pdf.truncate(pdf.len() - 2);
+
+        let (doc, page_count) = load_document_from_mem(&pdf)
+            .expect("truncated EOF and inline xref should both be repaired");
+
+        assert_eq!(page_count, 0);
+        assert_eq!(
+            doc.trailer.get(b"Root").unwrap().as_reference().unwrap(),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn loads_inline_xref_pdf_with_corrupted_startxref() {
+        let mut pdf = minimal_pdf_with_inline_xref_header();
+        let marker = find_last_subslice(&pdf, b"startxref\n").unwrap() + b"startxref\n".len();
+        let end = pdf[marker..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap()
+            + marker;
+        pdf[marker..end].fill(b'9');
+
+        let (doc, page_count) = load_document_from_mem(&pdf)
+            .expect("corrupted startxref and inline xref should both be repaired");
 
         assert_eq!(page_count, 0);
         assert_eq!(
