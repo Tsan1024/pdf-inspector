@@ -3552,6 +3552,7 @@ fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document
 fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut candidates = Vec::new();
 
+    add_repair_candidate(&mut candidates, repair_inline_xref_header(buf), buf);
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
     add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
 
@@ -3686,6 +3687,52 @@ fn add_repair_candidate(
     candidates.push(candidate);
 }
 
+fn repair_inline_xref_header(buf: &[u8]) -> Option<Vec<u8>> {
+    let eof_pos = find_last_subslice(buf, b"%%EOF")?;
+    let tail_start = eof_pos.saturating_sub(1024);
+    let startxref_pos = find_last_subslice(&buf[tail_start..eof_pos], b"startxref")? + tail_start;
+
+    let mut cursor = startxref_pos + b"startxref".len();
+    while buf.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+
+    let mut xref_offset = 0usize;
+    let digits_start = cursor;
+    while let Some(digit) = buf.get(cursor).filter(|byte| byte.is_ascii_digit()) {
+        xref_offset = xref_offset
+            .checked_mul(10)?
+            .checked_add((*digit - b'0') as usize)?;
+        cursor += 1;
+    }
+    if cursor == digits_start {
+        return None;
+    }
+
+    let separator = xref_offset.checked_add(b"xref".len())?;
+    if buf.get(xref_offset..separator)? != b"xref"
+        || buf.get(separator) != Some(&b' ')
+        || !buf
+            .get(separator + 1)
+            .is_some_and(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let mut repaired = buf.to_vec();
+    repaired[separator] = b'\n';
+    Some(repaired)
+}
+
+fn find_last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
 fn append_missing_eof_marker(buf: &[u8]) -> Option<Vec<u8>> {
     if contains_recent_eof_marker(buf) {
         return None;
@@ -3788,15 +3835,19 @@ fn process_document(
             options.page_filter.as_ref(),
         );
 
-        // For Mixed/template PDFs: if normal extraction produces garbage text
-        // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
-        // This unlocks OCR text layers behind scanned images.
-        if pdf_type == PdfType::Mixed {
+        // Retry an empty text-based result with invisible (Tr=3) text included.
+        // Some OCR-backed PDFs contain only an invisible text layer but are
+        // classified as TextBased because they have many text operators.
+        // Mixed/template PDFs additionally retry garbage visible text.
+        if matches!(pdf_type, PdfType::TextBased | PdfType::Mixed) {
             if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
-                        options
+                        matches!(
+                            item.item_type,
+                            types::ItemType::Text | types::ItemType::FormField
+                        ) && options
                             .page_filter
                             .as_ref()
                             .is_none_or(|filter| filter.contains(&item.page))
@@ -3804,7 +3855,9 @@ fn process_document(
                     .take(200)
                     .map(|item| item.text.as_str())
                     .collect();
-                if is_garbage_text(&sample) || sample.trim().is_empty() {
+                if sample.trim().is_empty()
+                    || (pdf_type == PdfType::Mixed && is_garbage_text(&sample))
+                {
                     extractor::extract_positioned_text_include_invisible_with_folio_context(
                         &doc,
                         &font_cmaps,
@@ -3813,13 +3866,15 @@ fn process_document(
                 } else {
                     result
                 }
-            } else {
+            } else if pdf_type == PdfType::Mixed {
                 // Normal extraction failed — try invisible as fallback
                 extractor::extract_positioned_text_include_invisible_with_folio_context(
                     &doc,
                     &font_cmaps,
                     options.page_filter.as_ref(),
                 )
+            } else {
+                result
             }
         } else {
             result
@@ -6094,6 +6149,42 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 mod tests {
     use super::*;
     use crate::types::ItemType;
+
+    fn minimal_pdf_with_inline_xref_header() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let catalog_offset = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let pages_offset = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Count 0 /Kids []>>\nendobj\n");
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref 0 3\n\
+                 0000000000 65535 f \n\
+                 {catalog_offset:010} 00000 n \n\
+                 {pages_offset:010} 00000 n \n\
+                 trailer\n\
+                 <</Size 3 /Root 1 0 R>>\n\
+                 startxref\n\
+                 {xref_offset}\n\
+                 %%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn loads_pdf_with_xref_section_on_keyword_line() {
+        let (doc, page_count) = load_document_from_mem(&minimal_pdf_with_inline_xref_header())
+            .expect("inline xref section header should be repaired");
+
+        assert_eq!(page_count, 0);
+        assert_eq!(
+            doc.trailer.get(b"Root").unwrap().as_reference().unwrap(),
+            (1, 0)
+        );
+    }
 
     fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
         TextItem {
